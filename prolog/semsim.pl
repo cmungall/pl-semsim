@@ -1,3 +1,5 @@
+/* -*- Mode: Prolog -*- */
+
 :- module(semsim,
           [
            semsim_all_by_all/1,
@@ -9,27 +11,28 @@
            semsim_element_attributeset/2,
            semsim_element_exists/1,
            semsim_attribute_exists/1,
+           semsim_element_pair/2,           
            semsim_pair_ci/3,
            semsim_pair_cu/3,
 	   semsim_pair_subset_of/3,
-           semsim_pair_simj/3,
-	   semsim_pair_ci_cu_simj/5,
-           semsim_pair_simj_of_f1/3,
-           semsim_pair_simj_of_f2/3,
+           semsim_pair_simJ/3,
+	   semsim_pair_simJ/5,
+           semsim_pair_simJ_of_f1/3,
+           semsim_pair_simJ_of_f2/3,
            semsim_pair_simGIC/3,
 	   semsim_pair_simICratio/3,
            semsim_pair_maxIC/3,
            semsim_pair_maxIC_attributes/4,
            semsim_pair_cossim/3,
-           semsim_pair_avgICCS/3,
-           semsim_pair_avgICCS/4,
+           semsim_pair_symmetric_bma_maxIC/3,
+           semsim_pair_symmetric_bma_maxIC/4,
            semsim_pair_nr_ICatt_pairs/4,
            semsim_pair_nr_independent_atts/4,
            semsim_pair_nr_independent_atts_corrected/6,
            semsim_attributeset_pair_csumIC_atts/6,
+           semsim_attributeset_pair_csumIC_atts/3,
            semsim_pair_pval_hyper/3,
            semsim_pair_pval_hyper/7,
-           semsim_attributeset_pair_csumIC_atts/3,
            semsim_attribute_pair_pval_hyper/7,
            semsim_pair_all_scores/3,
            semsim_element_vector/2,
@@ -40,31 +43,38 @@
            rksort_with_limit/3
           ]).
 
-:- use_module(library(semweb/rdf_db)).
+/** <module> semantic similarity
+
+  Predicates for comparing attributes based on their semantic
+  similarity.
+
+  This should be used in combination with a plugin module. For
+  example, basic_rdfs provides inference using OWL classes and
+  individuals.
+
+  Note that this module depends on SWI-Prolog compiled with GMP
+  support
+  
+*/
+
 
 :- dynamic element_ix/2.
 :- dynamic attribute_ix/2.
 :- dynamic semsim_element_vector_cached/2.
 :- dynamic attribute_vector_cached/2.
-:- dynamic template/3.
 :- dynamic semsim_element_attribute/2.
 :- dynamic semsim_element_attribute_direct/2.
 :- dynamic semsim_element_attributeset_cached/2.
 :- dynamic semsim_pair_score_cached/3.
 :- dynamic attribute_subsumer_vector_cached/2. % new
 
+:- multifile element_attribute_direct_hook/2.
+:- multifile element_attribute_indirect_hook/2.
+:- multifile semsim:attribute_ancestor_hook/2.
 
-
-% todo
-write_indexes :-
-        forall(member(P/A,
-                      [element_ix/2,
-                       attribute_ix/2,
-                       semsim_element_vector_cached/2,
-                       template/3,
-                       semsim_pair_score_cached/3]),
-               (   functor(Term,P,A),
-                   forall(Term,format('~q.~n',[Term])))).
+% ----------------------------------------
+% Indexing
+% ----------------------------------------
 
 
 %% generate_term_indexes
@@ -77,19 +87,19 @@ write_indexes :-
 % but they are used internally to map atoms to integer indexes
 % for efficient lookup of attribute vectors
 generate_term_indexes :-
-        retractall(semsim:semsim_element_attribute/2),
-        forall(rdfs_individual_of(I,C),assert(semsim:semsim_element_attribute(I,C))),
         retractall(semsim:semsim_element_attribute_direct/2),
-        forall(rdf(I,rdf:type,C),assert(semsim:semsim_element_attribute_direct(I,C))),
+        forall(element_attribute_direct_hook(I,C),assert(semsim:semsim_element_attribute_direct(I,C))),
+        retractall(semsim:semsim_element_attribute/2),
+        setof(I,C^element_attribute_direct_hook(I,C),Is),
+        forall((member(I,Is),element_attribute_indirect_hook(I,C)),assert(semsim:semsim_element_attribute(I,C))),
         retractall(semsim:semsim_element_vector_cached/2),
 	debug(sim,'generating semsim_element ix',[]),
-        setof(I,C^semsim:semsim_element_attribute(I,C),Is),
         generate_term_index(element_ix,Is),
 	debug(sim,'generating attribute ix',[]),
-        setof(C,I^semsim:semsim_element_attribute(I,C),Cs),
+        setof(C,I^semsim_element_attribute(I,C),Cs),
         generate_term_index(attribute_ix,Cs).
 
-%% generate_term_index(+Pred, +Terms:list)
+% generate_term_index(+Pred, +Terms:list) - private
 %
 % for each Term in Terms, generate a unit clause (fact):
 %
@@ -103,14 +113,14 @@ generate_term_indexes :-
 % Base = element_id | attribute_ix
 generate_term_index(Base, Terms) :-
         Clause =.. [Base,_,_],
-        retractall(G),
+        retractall(Clause),
         % this is a slightly ugly implementation,
         % but it avoids hitting the goal stack limit on
         % 32 bit machines
         nb_setval(n,0),
         forall(member(Term,Terms),
                (   nb_getval(n,Num),
-                   Fact =.. [Base,Template,Num],
+                   Fact =.. [Base,Term,Num],
                    assert(Fact),
                    Num2 is Num+1,
                    nb_setval(n,Num2))),
@@ -122,6 +132,10 @@ generate_term_index(Base, Terms) :-
 index_countvar(element_ix,semsim_element_count).
 index_countvar(attribute_ix,attribute_count).
 
+% ----------------------------------------
+% Basic stats
+% ----------------------------------------
+
 %% semsim_element_count(?NumSemsim_elements:int)
 semsim_element_count(X) :- nb_getval(semsim_element_count,X).
 
@@ -129,16 +143,19 @@ semsim_element_count(X) :- nb_getval(semsim_element_count,X).
 semsim_element_exists(X) :- element_ix(X,_).
 semsim_attribute_exists(X) :- attribute_ix(X,_).
 
+%% semsim_element_pair(?I,?J) is nondet
+semsim_element_pair(X,Y) :- element_ix(X,_),element_ix(Y,_).
+
 
 %% attribute_count(?NumAttributes:int)
 attribute_count(X) :- nb_getval(attribute_count,X).
 
 %% semsim_attribute_element_count(?A,?NumSemsim_elements:int)
+%
 % number of semsim_elements that have attribute A
 semsim_attribute_element_count(A,Num) :-
         attribute_ix(A,_),
-        template(F,A,Goal),
-        aggregate(count,F,Goal^Goal,Num).
+        aggregate(count,I,element_attribute_indirect_hook(I,A),Num).
 
 %% semsim_attribute_IC(?A,?IC:float)
 % -log2(p(A))
@@ -148,6 +165,10 @@ semsim_attribute_IC(A,IC) :-
         semsim_attribute_element_count(A,NumFA),
         semsim_element_count(NumF),
         IC is -(log(NumFA/NumF)/log(2)).
+
+% ----------------------------------------
+% Wrapper methods
+% ----------------------------------------
 
 semsim_all_by_all(SPairs) :-
         findall(Num-pair(F1,F2),
@@ -200,16 +221,6 @@ best_matches(L,L2,_) :-
         keysort(L,SL),
         reverse(SL,L2).
 
-rksort_with_limit(L,L2,Limit) :-
-        keysort(L,SL),
-        reverse(SL,RSL),
-        take_n(RSL,L2,Limit).
-
-take_n([],[],_) :- !.
-take_n(_,[],0) :- !.
-take_n([H|L],[H|L2],N) :-
-        Nm1 is N-1,
-        take_n(L,L2,Nm1).
 
 semsim_av_subsumes_element(AV,F) :-
 	semsim_element_vector(F,FV),
@@ -217,6 +228,9 @@ semsim_av_subsumes_element(AV,F) :-
 	VI = AV.
 
 
+% ----------------------------------------
+% Similarity Metrics
+% ----------------------------------------
 
 %% semsim_pair_ci(?F1,?F2,?Num:int)
 % intersection of attribute values:
@@ -250,8 +264,8 @@ semsim_pair_subset_of(F1,F2,S) :-
 	S is NumBoth/Num1.
 
 
-
-%% semsim_pair_simj(?F1,?F2,-Sim:float)
+%% semsim_pair_simJ(?F1,?F2,-Sim:float)
+%
 % Jacard similarity coefficient between two semsim_elements,
 % based on their attribute vectors:
 % | A1 ∩ A2| / | A1 ∪ A2|
@@ -260,26 +274,37 @@ semsim_pair_subset_of(F1,F2,S) :-
 %
 % Speed: the underlying implementation uses bitwise
 % operations on ints, so it should be super-fast
-semsim_pair_simj(F1,F2,Sim) :-
+semsim_pair_simJ(F1,F2,Sim) :-
         semsim_pair_cu(F1,F2,CU),
 	CU > 0,
         semsim_pair_ci(F1,F2,CI),
         Sim is CI/CU.
 
-semsim_pair_ci_cu_simj(F1,F2,CI,CU,Sim) :-
+%% semsim_pair_simJ(?F1,?F2,-Sim:float,NumInBoth:int,NumInEither:int)
+semsim_pair_simJ(F1,F2,Sim,CI,CU) :-
         semsim_pair_cu(F1,F2,CU),
 	CU > 0,
         semsim_pair_ci(F1,F2,CI),
         Sim is CI/CU.
 
-semsim_pair_simj_of_f1(F1,F2,Sim) :-
+%% semsim_pair_asymmetric_simJ(?F1,?F2,-Sim:float)
+%
+% | A1 | / | A1 ∪ A2|
+semsim_pair_asymmetric_simJ(F1,F2,Sim) :-
+        semsim_element_vector(F1,AV),
+        CU is popcount(AV),
+	CU > 0,
+        semsim_pair_cu(F1,F2,CI),
+        Sim is CI/CU.
+
+semsim_pair_simJ_of_f1(F1,F2,Sim) :-
         semsim_element_vector(F1,AV),
         CU is popcount(AV),
 	CU > 0,
         semsim_pair_ci(F1,F2,CI),
         Sim is CI/CU.
 
-semsim_pair_simj_of_f2(F1,F2,Sim) :-
+semsim_pair_simJ_of_f2(F1,F2,Sim) :-
         semsim_element_vector(F2,AV),
         CU is popcount(AV),
 	CU > 0,
@@ -427,7 +452,9 @@ semsim_pair_nr_independent_atts_corrected(F1,F2,N1,N2,SumIC,SortedPairs) :-
         semsim_element_attributeset(F2,AL2),
         semsim_semsim_attributeset_pair_csumIC_atts(AL1,AL2,N1,N2,SumIC,SortedPairs).
 
-semsim_semsim_attributeset_pair_csumIC_atts(AL1,AL2,N1,N2,SumIC,SortedPairs) :-
+semsim_attributeset_pair_csumIC_atts(AL1,AL2,SumIC) :-
+        semsim_attributeset_pair_csumIC_atts(AL1,AL2,_,_,SumIC,_).
+semsim_attributeset_pair_csumIC_atts(AL1,AL2,N1,N2,SumIC,SortedPairs) :-
         ord_intersection(AL1,AL2,AL_Both),
         AL_Both\=[],
         length(AL1,N1),
@@ -526,8 +553,8 @@ nr_subset(AL1,AL2) :-
                 (   member(A,AL1),
                     \+ ((member(A2,AL1),
                          A2\=A,
-                         rdfs_subclass_of(A2,A),
-                         \+ rdfs_subclass_of(A,A2)))),
+                         attribute_ancestor_hook(A2,A),
+                         \+ attribute_ancestor_hook(A,A2)))),
                 AL2).
 
 
@@ -553,30 +580,37 @@ semsim_pair_cossim(F1,F2,Sim) :-
         M2 is popcount(AV2),
         Sim is acos(DP / (sqrt(M1)*sqrt(M2))).
 
-semsim_pair_avgICCSnr(F1,F2,Sim,AL_nr) :-
-        semsim_pair_avgICCS(F1,F2,Sim,AL),
+semsim_pair_symmetric_bma_maxICnr(F1,F2,Sim,AL_nr) :-
+        semsim_pair_symmetric_bma_maxIC(F1,F2,Sim,AL),
         maplist(nr_subset,AL,AL_nr).
 
-%% semsim_pair_avgICCS(F1,F2,Sim)
-semsim_pair_avgICCS(F1,F2,Sim) :-
-        semsim_pair_avgICCS(F1,F2,Sim,_).
+%% semsim_pair_symmetric_bma_maxIC(F1,F2,Sim)
+semsim_pair_symmetric_bma_maxIC(F1,F2,Sim) :-
+        semsim_pair_symmetric_bma_maxIC(F1,F2,Sim,_).
 
-%% semsim_pair_avgICCS(?F1,?F2,?AvgICCS:float,?AttributeSets:list)
+%% semsim_pair_symmetric_bma_maxIC(?F1,?F2,?BMA:float,?AttributeSets:list)
+%
 % for each direct attribute, find the best match(es) in the other set.
 % do this symmetrically for both F1 and F2
-semsim_pair_avgICCS(F1,F2,Sim,AL) :-
-        element_ix(F1,_),
-        element_ix(F2,_),
-        setof(MaxIC-AMs,A^semsim_pair_attribute_maxIC_set(F1,F2,A,MaxIC,AMs),Set1),
-        setof(MaxIC-AMs,A^semsim_pair_attribute_maxIC_set(F2,F1,A,MaxIC,AMs),Set2),
-        union(Set1,Set2,Set),
+%
+semsim_pair_symmetric_bma_maxIC(F1,F2,Sim,AL) :-
+        element_ix(F1,_),       % ensure ground
+        element_ix(F2,_),       % ensure ground
+        semsim_pair_compare_all_atts_maxIC(F1,F2,Set1vs2),
+        semsim_pair_compare_all_atts_maxIC(F2,F1,Set2vs1),
+        union(Set1vs2,Set2vs1,Set),
         findall(MaxIC,member(MaxIC-_,Set),MaxICs),
         sumlist(MaxICs,MaxICSum),
         length(MaxICs,Len),
         Sim is MaxICSum/Len,
         findall(A,member(_-A,Set),AL).
 
+semsim_pair_compare_all_atts_maxIC(F1,F2,Set) :-
+        setof(MaxIC-AMs,A^semsim_pair_attribute_maxIC_set(F1,F2,A,MaxIC,AMs),Set).
+
+
 % semsim_pair_attribute_maxIC_set(?F1,?F2,?Att,-Max:float,?AttributesWithMax:list)
+%
 % for (+F1,+F2,+Att) this is deterministic.
 % if Att is in A(F1) then find the best att A2(s) in A(F2) with its IC.
 % there may be multiple such attributes, which is why we use a list
@@ -611,8 +645,8 @@ semsim_pair_all_scores(F1,F2,Scores) :-
         (   memberchk(simTO(SimTO),Scores)
         ->  semsim_pair_ci(F1,F2,SimTO)
         ;   true),
-        (   memberchk(simj(SimJ),Scores)
-        ->  semsim_pair_simj(F1,F2,SimJ)
+        (   memberchk(simJ(SimJ),Scores)
+        ->  semsim_pair_simJ(F1,F2,SimJ)
         ;   true),
         (   memberchk(simGIC(SimGIC),Scores)
         ->  semsim_pair_simGIC(F1,F2,SimGIC)
@@ -629,29 +663,31 @@ semsim_pair_all_scores(F1,F2,Scores) :-
         (   memberchk(maxICnr(MaxIC,MaxICAttrs),Scores)
         ->  semsim_pair_maxIC_nr_attributes(F1,F2,MaxIC,MaxICAttrs)
         ;   true),
-        (   memberchk(avgICCS(ICCS,CSSL),Scores)
-        ->  semsim_pair_avgICCS(F1,F2,ICCS,CSSL)
+        (   memberchk(symmetric_bma_maxIC(ICCS,CSSL),Scores)
+        ->  semsim_pair_symmetric_bma_maxIC(F1,F2,ICCS,CSSL)
         ;   true),
-        (   memberchk(avgICCSnr(ICCS,CSSL),Scores)
-        ->  semsim_pair_avgICCSnr(F1,F2,ICCS,CSSL)
+        (   memberchk(symmetric_bma_maxICnr(ICCS,CSSL),Scores)
+        ->  semsim_pair_symmetric_bma_maxICnr(F1,F2,ICCS,CSSL)
         ;   true),
         !.
 
 default_scores([simTO(_),
-                simj(_),
+                simJ(_),
                 simGIC(_),
                 maxIC(_,_),
-                avgICCS(_,_)]).
+                symmetric_bma_maxIC(_,_)]).
 
 
 %% semsim_compare_pair(+F1,+F2,-Score,+Opts)
 % Opts :
-%  metric(Metric) - one of simj, cossim, ci, or a list of Metrics. defaults to simj
+%  metric(Metric) - one of simJ, cossim, ci, or a list of Metrics. defaults to simJ
 semsim_compare_pair(F1,F2,Score,Opts) :-
         (   member(metric(Metric),Opts)
         ->  true
-        ;   Metric=simj),
+        ;   Metric=simJ),
         semsim_compare_pair_by_metric(F1,F2,Score,Metric,Opts).
+semsim_compare_pair(F1,F2,Score) :-
+        semsim_compare_pair(F1,F2,Score,[]).
 
 % in the case where multiple metrics are required, the score is of
 % the form MainScore-[score(M1,S1),score(M2,S2),...].
@@ -673,18 +709,18 @@ semsim_compare_pair_by_metric(F1,F2,AllScore,L,Opts) :-
 semsim_compare_pair_by_metric(F1,F2,MaxIC-MaxICAttrs,maxIC,_Opts) :-
         !,
         semsim_pair_maxIC_attributes(F1,F2,MaxIC,MaxICAttrs).
-semsim_compare_pair_by_metric(F1,F2,Score,simj,_Opts) :-
+semsim_compare_pair_by_metric(F1,F2,Score,simJ,_Opts) :-
         !,
-        semsim_pair_simj(F1,F2,Score).
+        semsim_pair_simJ(F1,F2,Score).
 semsim_compare_pair_by_metric(F1,F2,Score,cossim,_Opts) :-
         !,
         semsim_pair_cossim(F1,F2,Score).
 semsim_compare_pair_by_metric(F1,F2,Score,simGIC,_Opts) :-
         !,
         semsim_pair_simGIC(F1,F2,Score).
-semsim_compare_pair_by_metric(F1,F2,Score,avgICCS,_Opts) :-
+semsim_compare_pair_by_metric(F1,F2,Score,symmetric_bma_maxIC,_Opts) :-
         !,
-        semsim_pair_avgICCS(F1,F2,Score).
+        semsim_pair_symmetric_bma_maxIC(F1,F2,Score).
 semsim_compare_pair_by_ci(F1,F2,Score,ci,_Opts) :-
         !,
         semsim_pair_ci(F1,F2,Score).
@@ -709,8 +745,7 @@ semsim_element_vector(F,V) :-
         !.
 
 semsim_element_vector(F,V) :-
-        template(F,Attribute,Goal),
-        solutions(Num,(Goal,attribute_ix(Attribute,AI),Num is 2**AI),Nums),
+        solutions(Num,(element_attribute_indirect_hook(F,Attribute),attribute_ix(Attribute,AI),Num is 2**AI),Nums),
         sumlist(Nums,V),
         assert(semsim_element_vector_cached(F,V)).
 
@@ -777,7 +812,7 @@ semsim_attribute_pair_pval_hyper(A1,A2,Vk,Vn,Vm,VN,P) :-
 % attribute_subsumer_vector(+Att,-AttSubsumerVector:int)
 % maps an attribute to an integer bitvector for all subsuming (parent) attributes
 attribute_subsumer_vector(A,ASV) :-
-        solutions(P,rdfs_subclass_of(A,P),Ps), % from data
+        solutions(P,attribute_ancestor_hook(A,P),Ps), % from data
         solutions(PI,(member(P,Ps),attribute_ix(P,PI)),PIs),
         solutions(Num,(member(PI,PIs),Num is 2**PI),Nums),
         sumlist(Nums,ASV),
@@ -866,102 +901,26 @@ vector_attributes_lo(AV,AL,Pos) :-
         !,
         vector_attributes_lo(AVShift,AL2,NextPos).
 
-        
+% ----------------------------------------
+% util
+% ----------------------------------------
 
-/** <module> statistics for semsim_element-attribute matrices
+%% solutions(+Template,+Goal,-Set)
+%   deterministic setof (will not fail). Goal is existentially quantified
+solutions(X,Goal,Xs):-
+        (   setof(X,Goal^Goal,Xs)
+        ->  true
+        ;   Xs=[]).
 
-  ---+ Synopsis
+rksort_with_limit(L,L2,Limit) :-
+        keysort(L,SL),
+        reverse(SL,RSL),
+        take_n(RSL,L2,Limit).
 
-==
-:- use_module(bio(semsim)).
-
-likes(jim,cheese).
-likes(jim,pizza).
-likes(fred,pizza).
-likes(fred,burrito).
-likes(homer,beer).
-likes(charlie,cheese).
-% ...
-
-% 
-demo:-
-  generate_term_indexes(F,A,likes(F,A)),
-  semsim_element_matches(jim,Matches,[limit(100)]),
-  forall(member(Match,Matches),
-         format('  Match: ~w~n',[Match])),
-  semsim_pair_simj(homer,charlie,Sim),
-  writenl(Sim).
-==
-
----+ Details
-
-REQUIRES GMP!!
-
-Given a predicate that relates a set of semsim_elements F to a set of
-attributes A, we can determine the similarity between any pair in F
-based on the attributes they share in common.
-
-This library uses bit vectors to store the attribute vector for each
-semsim_element (thus SWI-Prolog with GMP is required). The library user can
-use arbitrary terms for the attributes, the library will take care of
-mapping these to integers that index the bit vectors.
+take_n([],[],_) :- !.
+take_n(_,[],0) :- !.
+take_n([H|L],[H|L2],N) :-
+        Nm1 is N-1,
+        take_n(L,L2,Nm1).
 
 
-Use in the context of blip with GO data:
-
-==
-blip -r go_assoc_local/GeneDB_Tbrucei -u curation_db -u semsim -r go -u tabling
-Starting blip shell
-1 ?- table_pred(curation_db:curation_statementT/4).
-true.
-
-2 ?- generate_term_indexes(G,T,curation_statementT(_,G,_,T)).
-true.
-
-3 ?- semsim_pair_simj('GeneDB_Tbrucei:Tb927.3.1380','GeneDB_Tbrucei:Tb10.389.1170',Num).
-Num = 27.
-==
-
-This uses inferred annotations via ontol_reasoner:
-
-==
-blip -r implied/go -r go_assoc_local/GeneDB_Tbrucei -u curation_db -u ontol_db -u semsim -goal "generate_term_indexes(G,T,(curation_statement(_,G,_,T1),parent(T1,T)))"
-==
-
----++ Recipes
-
-Given a two-column file
-==
-load_biofile(tbl(likes),'file.tab'),
-generate_term_indexes(P,F,likes(P,F)).
-==
-
----++ Comparing attributes
-
-Attributes may not be independent
-
----++ Performance notes
-
-tested with semsim_element set of size 170k, attribute set of size 28k, 13m positive attribute values
-
-initial indexing takes ~1m
-
-caching of all semsim_element_vector/2 facts takes ~1gb
-
-subsequent searches extremely fast
-
-IC based metrics or any kind of weighting slows it down a lot...
-
-
-
----+ Additional Information
-
-This module is part of blip. For more details, see http://www.blipkit.org
-
-@author  Chris Mungall
-@version $Revision$
-@see     README
-@license License
-
-
-*/
